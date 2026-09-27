@@ -1,0 +1,35 @@
+name: marian_flutter
+description: On-device MarianMT for Flutter via Candle + flutter_rust_bridge (Android first).
+version: 0.1.0
+homepage: https://github.com/malinali-app/marian_flutter
+repository: https://github.com/malinali-app/marian_flutter
+issue_tracker: https://github.com/malinali-app/marian_flutter/issues
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_rust_bridge: ^2.13.0
+  path: ^1.9.0
+  path_provider: ^2.1.4
+  plugin_platform_interface: ^2.0.2
+
+dev_dependencies:
+  ffi: ^2.1.3
+  ffigen: ^20.1.1
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  integration_test:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
