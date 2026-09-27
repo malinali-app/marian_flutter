@@ -36,11 +36,28 @@ struct TranslatorInner {
     device: Device,
 }
 
-#[derive(Clone)]
 struct Beam {
     tokens: Vec<u32>,
     score: f32,
     finished: bool,
+    /// Per-beam decoder KV state. Weights are shared via [`MTModel::clone`].
+    /// Cleared (`None`) once the hypothesis is finished.
+    model: Option<MTModel>,
+}
+
+struct BeamCand {
+    parent_idx: usize,
+    tokens: Vec<u32>,
+    score: f32,
+    finished: bool,
+}
+
+struct ExpandedParent {
+    tokens: Vec<u32>,
+    score: f32,
+    /// Decoder state after the expand step (cache covers `tokens`).
+    model: MTModel,
+    next: Vec<(u32, f32)>,
 }
 
 /// On-device MarianMT translator backed by Candle.
@@ -81,7 +98,7 @@ impl MarianTranslator {
     pub fn load_from_dir(model_dir: String) -> Result<Self, String> {
         let dir = PathBuf::from(&model_dir);
         let model_path = first_existing(&dir, &["model.safetensors"])
-            .ok_or_else(|| format!("model.safetensors not found in {model_dir}"))?;
+            .ok_or_else(|| format!("Le modèle n'a pas pu être chargé (poids manquants dans {model_dir})."))?;
         let config_path = first_existing(&dir, &["config.json"])
             .ok_or_else(|| format!("config.json not found in {model_dir}"))?;
         
@@ -282,20 +299,179 @@ fn beam_search(
     encoder_xs: &Tensor,
     cfg: &TranslationConfig,
 ) -> AnyResult<Vec<u32>> {
+    beam_search_incremental(inner, encoder_xs, cfg)
+}
+
+/// Fast path: one decode token per beam step, private KV cache per beam.
+fn beam_search_incremental(
+    inner: &mut TranslatorInner,
+    encoder_xs: &Tensor,
+    cfg: &TranslationConfig,
+) -> AnyResult<Vec<u32>> {
+    let num_beams = cfg.num_beams as usize;
+    let max_new = cfg.max_new_tokens as usize;
+    let length_penalty = cfg.length_penalty;
+    let ngram = cfg.no_repeat_ngram_size as usize;
+    let eos = inner.config.eos_token_id;
+    let forced_eos = inner.config.forced_eos_token_id;
+    let bos = inner.config.decoder_start_token_id;
+
+    // Encoder already ran on `inner.model`; clear caches before cloning beams.
+    inner.model.reset_kv_cache();
+
+    let mut beams = vec![Beam {
+        tokens: vec![bos],
+        score: 0.0,
+        finished: false,
+        model: Some(inner.model.clone()),
+    }];
+    let mut finished: Vec<Beam> = Vec::new();
+
+    for step in 0..max_new {
+        let mut parents: Vec<ExpandedParent> = Vec::new();
+
+        for beam in beams.drain(..) {
+            if beam.finished {
+                finished.push(beam);
+                continue;
+            }
+            let mut model = beam
+                .model
+                .ok_or_else(|| anyhow!("live beam missing decoder state"))?;
+            let l = beam.tokens.len();
+            let (start_pos, slice): (usize, &[u32]) = if step == 0 {
+                (0, beam.tokens.as_slice())
+            } else {
+                (l - 1, &beam.tokens[l - 1..])
+            };
+
+            let input_ids = Tensor::new(slice, &inner.device)?.unsqueeze(0)?;
+            let logits = model.decode(&input_ids, encoder_xs, start_pos)?;
+            let logits = logits.squeeze(0)?;
+            let logits = logits.get(logits.dim(0)? - 1)?;
+            let mut scores = logits.to_vec1::<f32>()?;
+            apply_no_repeat_ngram(&beam.tokens, &mut scores, ngram);
+            log_softmax_inplace(&mut scores);
+
+            let next: Vec<(u32, f32)> = top_k_indices(&scores, num_beams)
+                .into_iter()
+                .map(|idx| (idx as u32, scores[idx]))
+                .collect();
+
+            parents.push(ExpandedParent {
+                tokens: beam.tokens,
+                score: beam.score,
+                model,
+                next,
+            });
+        }
+
+        let mut candidates: Vec<BeamCand> = Vec::new();
+        for (parent_idx, parent) in parents.iter().enumerate() {
+            for &(token, log_p) in &parent.next {
+                let mut tokens = parent.tokens.clone();
+                tokens.push(token);
+                let done = token == eos || token == forced_eos;
+                candidates.push(BeamCand {
+                    parent_idx,
+                    tokens,
+                    score: parent.score + log_p,
+                    finished: done,
+                });
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            normalized_score(b.score, b.tokens.len(), length_penalty)
+                .partial_cmp(&normalized_score(a.score, a.tokens.len(), length_penalty))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut parent_taken = vec![false; parents.len()];
+        for cand in candidates {
+            if cand.finished {
+                finished.push(Beam {
+                    tokens: cand.tokens,
+                    score: cand.score,
+                    finished: true,
+                    model: None,
+                });
+            } else if beams.len() < num_beams {
+                let model = take_or_clone_parent(&mut parents, &mut parent_taken, cand.parent_idx);
+                beams.push(Beam {
+                    tokens: cand.tokens,
+                    score: cand.score,
+                    finished: false,
+                    model: Some(model),
+                });
+            }
+            if beams.len() >= num_beams && finished.len() >= num_beams {
+                break;
+            }
+        }
+
+        if beams.is_empty() {
+            break;
+        }
+    }
+
+    finished.extend(beams);
+    finished.sort_by(|a, b| {
+        normalized_score(b.score, b.tokens.len(), length_penalty)
+            .partial_cmp(&normalized_score(a.score, a.tokens.len(), length_penalty))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    finished
+        .into_iter()
+        .next()
+        .map(|b| b.tokens)
+        .ok_or_else(|| anyhow!("beam search produced no hypotheses"))
+}
+
+fn take_or_clone_parent(
+    parents: &mut [ExpandedParent],
+    parent_taken: &mut [bool],
+    parent_idx: usize,
+) -> MTModel {
+    if !parent_taken[parent_idx] {
+        parent_taken[parent_idx] = true;
+        // First survivor reuses the expanded parent model; leave a clone for siblings.
+        let keep = parents[parent_idx].model.clone();
+        std::mem::replace(&mut parents[parent_idx].model, keep)
+    } else {
+        parents[parent_idx].model.clone()
+    }
+}
+
+/// Legacy path: full decoder re-run per beam step (kept for A/B regression tests).
+#[cfg(test)]
+fn beam_search_full_redecode(
+    inner: &mut TranslatorInner,
+    encoder_xs: &Tensor,
+    cfg: &TranslationConfig,
+) -> AnyResult<Vec<u32>> {
     let num_beams = cfg.num_beams as usize;
     let max_new = cfg.max_new_tokens as usize;
     let length_penalty = cfg.length_penalty;
     let ngram = cfg.no_repeat_ngram_size as usize;
 
-    let mut beams = vec![Beam {
+    #[derive(Clone)]
+    struct LegacyBeam {
+        tokens: Vec<u32>,
+        score: f32,
+        finished: bool,
+    }
+
+    let mut beams = vec![LegacyBeam {
         tokens: vec![inner.config.decoder_start_token_id],
         score: 0.0,
         finished: false,
     }];
-    let mut finished: Vec<Beam> = Vec::new();
+    let mut finished: Vec<LegacyBeam> = Vec::new();
 
     for _step in 0..max_new {
-        let mut candidates: Vec<Beam> = Vec::new();
+        let mut candidates: Vec<LegacyBeam> = Vec::new();
 
         for beam in &beams {
             if beam.finished {
@@ -303,7 +479,6 @@ fn beam_search(
                 continue;
             }
 
-            // Full decoder pass per candidate (no per-beam KV cache). Fine for short phrases.
             inner.model.reset_kv_cache();
             let input_ids = Tensor::new(beam.tokens.as_slice(), &inner.device)?.unsqueeze(0)?;
             let logits = inner.model.decode(&input_ids, encoder_xs, 0)?;
@@ -319,7 +494,7 @@ fn beam_search(
                 next_tokens.push(token);
                 let done = token == inner.config.eos_token_id
                     || token == inner.config.forced_eos_token_id;
-                candidates.push(Beam {
+                candidates.push(LegacyBeam {
                     tokens: next_tokens,
                     score: beam.score + scores[idx],
                     finished: done,
@@ -425,4 +600,147 @@ fn top_k_indices(scores: &[f32], k: usize) -> Vec<usize> {
     });
     idx.truncate(k);
     idx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../test/fixtures/fr-pul")
+    }
+
+    fn load_fixture() -> TranslatorInner {
+        let dir = fixture_dir();
+        assert!(
+            dir.join("model.safetensors").is_file(),
+            "missing fixture at {}",
+            dir.display()
+        );
+        load_inner(
+            dir.join("model.safetensors"),
+            dir.join("config.json"),
+            dir.join("tokenizer-enc.json"),
+            dir.join("tokenizer-dec.json"),
+        )
+        .expect("load fixture")
+    }
+
+    fn encode(inner: &mut TranslatorInner, text: &str) -> Tensor {
+        let mut tokens = inner
+            .tokenizer_enc
+            .encode(text, true)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        tokens.push(inner.config.eos_token_id);
+        inner.model.reset_kv_cache();
+        let encoder_input = Tensor::new(tokens.as_slice(), &inner.device)
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
+        inner.model.encoder().forward(&encoder_input, 0).unwrap()
+    }
+
+    fn detok(inner: &TranslatorInner, ids: &[u32]) -> String {
+        let mut decode_ids: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != inner.config.decoder_start_token_id)
+            .collect();
+        if let Some(pos) = decode_ids.iter().position(|id| {
+            *id == inner.config.eos_token_id || *id == inner.config.forced_eos_token_id
+        }) {
+            decode_ids.truncate(pos);
+        }
+        inner.tokenizer_dec.decode(&decode_ids, true).unwrap()
+    }
+
+    #[test]
+    fn incremental_matches_legacy_beam_search() {
+        let mut inner = load_fixture();
+        let cfg = TranslationConfig {
+            num_beams: 2,
+            max_new_tokens: 16,
+            length_penalty: 1.2,
+            no_repeat_ngram_size: 3,
+        };
+        let sentences = [
+            "Bonjour",
+            "Comment ça va ?",
+            "Je voudrais un café.",
+        ];
+
+        for text in sentences {
+            let encoder_xs = encode(&mut inner, text);
+            let legacy = beam_search_full_redecode(&mut inner, &encoder_xs, &cfg).unwrap();
+            // Re-encode: legacy mutates inner.model KV; incremental clones from a reset template.
+            let encoder_xs = encode(&mut inner, text);
+            let fast = beam_search_incremental(&mut inner, &encoder_xs, &cfg).unwrap();
+
+            let legacy_txt = detok(&inner, &legacy);
+            let fast_txt = detok(&inner, &fast);
+            assert_eq!(
+                legacy, fast,
+                "token mismatch for '{text}': legacy={legacy_txt:?} fast={fast_txt:?}"
+            );
+            assert!(!fast_txt.trim().is_empty(), "empty translation for '{text}'");
+        }
+    }
+
+    #[test]
+    fn incremental_is_faster_than_legacy() {
+        let mut inner = load_fixture();
+        // Higher beams + longer cap make the legacy O(T²) path hurt more,
+        // which is where incremental KV caching pays off.
+        let cfg = TranslationConfig {
+            num_beams: 4,
+            max_new_tokens: 48,
+            length_penalty: 1.2,
+            no_repeat_ngram_size: 3,
+        };
+        let text = "Je voudrais aller au marché demain matin avec mes enfants pour acheter du pain et du lait.";
+
+        // Warmup both paths (mmap / BLAS / caches).
+        let encoder_xs = encode(&mut inner, text);
+        let legacy_warm = beam_search_full_redecode(&mut inner, &encoder_xs, &cfg).unwrap();
+        let encoder_xs = encode(&mut inner, text);
+        let fast_warm = beam_search_incremental(&mut inner, &encoder_xs, &cfg).unwrap();
+        assert_eq!(legacy_warm, fast_warm, "warmup outputs must match");
+        eprintln!(
+            "warmup hyp len={} text={:?}",
+            legacy_warm.len(),
+            detok(&inner, &legacy_warm)
+        );
+
+        const N: u32 = 3;
+        let mut legacy_ms = 0u128;
+        let mut fast_ms = 0u128;
+
+        for _ in 0..N {
+            let encoder_xs = encode(&mut inner, text);
+            let t0 = Instant::now();
+            let _ = beam_search_full_redecode(&mut inner, &encoder_xs, &cfg).unwrap();
+            legacy_ms += t0.elapsed().as_millis();
+
+            let encoder_xs = encode(&mut inner, text);
+            let t1 = Instant::now();
+            let _ = beam_search_incremental(&mut inner, &encoder_xs, &cfg).unwrap();
+            fast_ms += t1.elapsed().as_millis();
+        }
+
+        let legacy_avg = legacy_ms as f64 / N as f64;
+        let fast_avg = fast_ms as f64 / N as f64;
+        let speedup = legacy_avg / fast_avg.max(1.0);
+        eprintln!(
+            "beam decode avg over {N}: legacy={legacy_avg:.0}ms incremental={fast_avg:.0}ms speedup={speedup:.2}x"
+        );
+
+        assert!(
+            speedup >= 1.3,
+            "expected incremental to be >=1.3x faster (legacy={legacy_avg:.0}ms fast={fast_avg:.0}ms)"
+        );
+    }
 }

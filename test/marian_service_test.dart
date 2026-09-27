@@ -12,8 +12,8 @@ import 'package:path/path.dart' as p;
 /// (uses WSL Python for tokenizer conversion)
 void main() {
   test('street translation config defaults', () {
-    expect(kStreetTranslationConfig.numBeams, 4);
-    expect(kStreetTranslationConfig.maxNewTokens, 48);
+    expect(kStreetTranslationConfig.numBeams, 2);
+    expect(kStreetTranslationConfig.maxNewTokens, 24);
     expect(kStreetTranslationConfig.lengthPenalty, 1.2);
     expect(kStreetTranslationConfig.noRepeatNgramSize, 3);
   });

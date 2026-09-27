@@ -14,10 +14,10 @@ export 'rust/frb_generated.dart' show RustLib;
 
 /// Street-mode decode defaults for on-device Candle.
 ///
-/// HuggingFace `demo.py --label street` uses `num_beams=4`, but our beam loop
-/// re-runs the full decoder per candidate (no per-beam KV cache), so 4×48 is
-/// multi-second on CPU and looks hung in an unoptimized Flutter Debug DLL.
-/// Beams=2 / 24 new tokens keeps street length penalty while staying interactive.
+/// HuggingFace `demo.py --label street` uses `num_beams=4`. Beam search now
+/// keeps a per-beam KV cache (incremental decode), but 4×48 is still heavy on
+/// phone CPUs — beams=2 / 24 new tokens stays interactive while retaining the
+/// street length penalty.
 const TranslationConfig kStreetTranslationConfig = TranslationConfig(
   numBeams: 2,
   maxNewTokens: 24,

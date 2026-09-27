@@ -1,15 +1,24 @@
 # marian_flutter
 
-On-device **MarianMT** for Flutter, powered by [Candle](https://github.com/huggingface/candle)
+On-device **MarianMT** for Flutter via [Candle](https://github.com/huggingface/candle)
 and [flutter_rust_bridge](https://cjycode.com/flutter_rust_bridge/) (v2 + Cargokit).
 
 **Platform focus:** Android first (`arm64-v8a` / `armeabi-v7a` via Cargokit).
 
+## Background
+
+Started in 2025 as a PC FFI spike (`marian_dart`) to show Candle can run MarianMT from Dart.
+This Flutter plugin is the real product: load **Helsinki / HuggingFace MarianMT** checkpoints
+and, most importantly, **fine-tune on private or domain-specific bitext** then ship the same
+`safetensors` folder on device.
+
+Related: [`mariannmt_wrapper`](https://pub.dev/packages/mariannmt_wrapper) wraps Marian NMT (C++ /
+Bergamot). It is often faster on phone, but only accepts **[Mozilla Translations](https://github.com/mozilla/translations) / Bergamot-compatible** packs — heavier train/export than HF → Candle.
+
+
 ## Why not ONNX-only?
 
-This package keeps HuggingFace SentencePiece tokenization (`tokenizers` crate)
-and beam search (`num_beams=4`, length penalty, no-repeat n-gram) in Rust so
-mobile output matches training/`demo.py` quality.
+Tokenization (`tokenizers` crate) and beam search stay in Rust so mobile output matches training / `demo.py` quality.
 
 ## Model folder layout
 

@@ -1,6 +1,6 @@
 name: marian_flutter
 description: On-device MarianMT for Flutter via Candle + flutter_rust_bridge (Android first).
-version: 0.1.0
+version: 0.2.0
 homepage: https://github.com/malinali-app/marian_flutter
 repository: https://github.com/malinali-app/marian_flutter
 issue_tracker: https://github.com/malinali-app/marian_flutter/issues
